@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+.npm-cache/
+.bun-cache/
+.pnpm-store/
+
+# Build output
+dist/
+build/
+*.tgz
+
+# Logs
+*.log
+npm-debug.log*
+yarn-error.log*
+logs/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Never commit private keys
+*.pem
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.ppk
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.history/
+
+# Local scratch
+.tools/
+.plans/
+*.local
