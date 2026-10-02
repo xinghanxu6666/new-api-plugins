@@ -1,0 +1,27 @@
+{
+  "indexVersion": 1,
+  "name": "xinghanxu Plugin Market",
+  "plugins": [
+    {
+      "key": "test",
+      "name": "test",
+      "description": "test",
+      "channelTypes": [
+        61
+      ],
+      "models": [
+        "test"
+      ],
+      "latest": "1.0.0",
+      "versions": [
+        {
+          "version": "1.0.0",
+          "path": "plugins/tasks/test/1.0.0/plugin.js",
+          "sha256": "71e1fef571eb6f2eeeef2bf6989d306909f17aa4a3c4bf3fc11ffcd206f27705",
+          "minApiVersion": 1,
+          "kind": "task"
+        }
+      ]
+    }
+  ]
+}
