@@ -3,23 +3,29 @@
   "name": "xinghanxu Plugin Market",
   "plugins": [
     {
-      "key": "test",
-      "name": "test",
-      "description": "test",
+      "key": "simpass",
+      "name": "Simpass(星涵煦版)",
+      "description": {
+        "en": "SimPass (JianHuanTong) WeChat identity verification: create OTP challenges and look up player verification info",
+        "zh": "SimPass 简幻通微信身份验证：生成 OTP 认证并查询玩家验证信息"
+      },
       "channelTypes": [
         61
       ],
       "models": [
-        "test"
+        "simpass-otp",
+        "simpass-验证"
       ],
-      "latest": "1.0.0",
+      "latest": "0.0.1",
       "versions": [
         {
-          "version": "1.0.0",
-          "path": "plugins/tasks/test/1.0.0/plugin.js",
-          "sha256": "71e1fef571eb6f2eeeef2bf6989d306909f17aa4a3c4bf3fc11ffcd206f27705",
+          "version": "0.0.1",
+          "path": "plugins/tasks/simpass/0.0.1/plugin.js",
+          "sha256": "d493618647c67968ba8cde8c00cb56852cd47c904fae043660fde15107fcb0b7",
           "minApiVersion": 1,
-          "kind": "task"
+          "kind": "task",
+          "baseUrl": "https://pass.simpfun.cn",
+          "auth": "api_key"
         }
       ]
     }
