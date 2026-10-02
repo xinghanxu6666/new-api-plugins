@@ -9,9 +9,6 @@
         "en": "SimPass (JianHuanTong) WeChat identity verification: create OTP challenges and look up player verification info",
         "zh": "SimPass 简幻通微信身份验证：生成 OTP 认证并查询玩家验证信息"
       },
-      "channelTypes": [
-        61
-      ],
       "models": [
         "simpass-otp",
         "simpass-验证"
@@ -21,7 +18,7 @@
         {
           "version": "0.0.1",
           "path": "plugins/tasks/simpass/0.0.1/plugin.js",
-          "sha256": "d493618647c67968ba8cde8c00cb56852cd47c904fae043660fde15107fcb0b7",
+          "sha256": "d82a0bc9abf3e83c238d75410b1a3790013666bfc82dd238370454b46d12f67a",
           "minApiVersion": 1,
           "kind": "task",
           "baseUrl": "https://pass.simpfun.cn",

@@ -93,7 +93,10 @@ export const meta = {
   },
   baseUrl: DEFAULT_BASE_URL,
   auth: "api_key",
-  channelTypes: [61],
+  // channelTypes is deliberately omitted. It declares legacy vendor channel
+  // types only; the host rejects both the task plugin type (61) and the New API
+  // type (60) here, because a task plugin binds through the channel's
+  // task_plugin_key setting instead. SimPass has no legacy channel type.
   upstreams: ["vendor", "new_api"],
   models: [MODEL_OTP, MODEL_INFO],
   fetchMode: "per_task",
