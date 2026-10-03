@@ -6,19 +6,20 @@
       "key": "simpass",
       "name": "Simpass(星涵煦版)",
       "description": {
-        "en": "SimPass (JianHuanTong) WeChat identity verification: create OTP challenges and look up player verification info",
-        "zh": "SimPass 简幻通微信身份验证：生成 OTP 认证并查询玩家验证信息"
+        "en": "SimPass (JianHuanTong) WeChat identity verification, served as an OpenAI Chat Completions compatible endpoint",
+        "zh": "SimPass 简幻通微信身份验证，以 OpenAI Chat Completions 兼容接口对外提供服务"
       },
       "models": [
-        "simpass-otp",
-        "simpass-验证"
+        "simpass-auth1",
+        "simpass-otp-请求",
+        "simpass-otp-查询"
       ],
       "latest": "0.0.1",
       "versions": [
         {
           "version": "0.0.1",
           "path": "plugins/tasks/simpass/0.0.1/plugin.js",
-          "sha256": "d82a0bc9abf3e83c238d75410b1a3790013666bfc82dd238370454b46d12f67a",
+          "sha256": "ad8885e036fbda78061979d398b0b974c22a71b729f71352a47abc4544a4e91f",
           "minApiVersion": 1,
           "kind": "task",
           "baseUrl": "https://pass.simpfun.cn",

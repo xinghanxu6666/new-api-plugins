@@ -2,83 +2,94 @@
  * SimPass (简幻通) — New API task plugin
  *
  * SimPass is a WeChat-mini-program identity verification system for game
- * servers. Developer API documentation:
- *   https://s.apifox.cn/2ee8388d-101e-4268-bfa5-412e8044675a
+ * servers. Two contracts matter, and they are different:
+ *
+ * INBOUND — how a caller addresses this plugin (documented at
+ * https://txpass-2.apifox.cn, OpenAI Chat Completions compatible):
+ *
+ *   POST <gateway>/simpass/v1/chat/completions
+ *   Authorization: Bearer <New API token>
+ *   { "model": "<one of three>", "messages": [{ "role": "user", "content": "<JSON string>" }] }
+ *
+ *   simpass-auth1       content { user_id, verify_code[, mc_username, mc_uuid, player_ip] }
+ *                       -> { success: true, data: { code, msg, user_info } }
+ *   simpass-otp-请求    content {} or { mc_uuid?, mc_username?, player_ip? }
+ *                       -> { success: true, data: { otp_id, expires_in, status: "pending" } }
+ *   simpass-otp-查询    content { otp_id }
+ *                       -> { success: true, data: { status, user_id?, user_info? } }
+ *                          status is pending | verified | rejected
+ *
+ *   The reply is a chat.completion whose choices[0].message.content is the JSON
+ *   envelope above, serialized. Failures use
+ *   { success: false, error: { message, type, code }, help }.
+ *
+ *   The documented route is POST /v1/chat/completions, but a plugin route may not
+ *   claim it: the host rejects any plugin route that intersects a static route
+ *   (router/plugin-router.go validatePlugin -> routeIntersectsStaticRoute), and
+ *   /v1/chat/completions is New API's own relay endpoint. This plugin therefore
+ *   serves the identical contract one segment deeper, under /simpass.
+ *
+ * UPSTREAM — the SimPass developer API (base URL https://pass.simpfun.cn), which
+ * is what the plugin actually calls:
+ *
+ *   POST /api/dev/auth    body { uuid, user_id, verify_code[, mc_username, mc_uuid, player_ip] }
+ *                         -> { code, msg, user_info }; code 200 means success
+ *   GET  /api/dev/otp?uuid=<developer uuid>[&mc_uuid=][&mc_username=][&player_ip=]
+ *                         -> { otp_id, expires_in }
+ *   GET  /api/dev/otp?otp_id=<otp_id>
+ *                         -> { status } while pending
+ *                         -> { status: "verified", user_id, user_info } once verified
+ *   Errors                HTTP 4xx/5xx, sometimes an HTML 500 page
+ *
+ *   POST /api/dev/auth is undocumented in the public SimPass pages; it was found
+ *   by probing and is the endpoint behind the documented verify_code flow.
  *
  * This plugin addresses two upstream kinds, selected by the executing channel:
  *
- *   vendor   (channel type 61, key = the SimPass developer UUID)
- *     The upstream API surface is (base URL https://pass.simpfun.cn):
- *       Create OTP   GET /api/dev/otp?uuid=<developer uuid>[&mc_uuid=][&mc_username=][&player_ip=]
- *                    -> { otp_id, expires_in }
- *       Poll OTP     GET /api/dev/otp?otp_id=<otp_id>
- *                    -> { status }                                  while still pending
- *                    -> { status: "verified", user_id, user_info }   once verified
- *       User info    GET /api/dev/info?uuid=<developer uuid>&user_id=<user id>
- *                    -> { level, risky, create_time[, risk_details] }
- *       Errors       HTTP 400/401/403/404/500 with { "error": "<message>" }
- *     Credentials ride in the query string as uuid=, not in a header, so
- *     ctx.apiKey is placed in the query. The host injects ctx.apiKey for auth
- *     type api_key (relay/channel/task/jsplugin/auth.go).
+ *   vendor   channel type 61, key = the SimPass developer UUID. Credentials ride
+ *            in the JSON body (auth) or the query string (otp), never a header.
+ *            The host injects ctx.apiKey for auth type api_key
+ *            (relay/channel/task/jsplugin/auth.go).
+ *   new_api  channel type 60, key = a token of the upstream gateway. The upstream
+ *            is another New API with this plugin installed, so its chat route is
+ *            addressed instead, with the channel key as a Bearer token
+ *            (adaptor.go applyUpstreamCredentials). Declaring
+ *            upstreams: ["new_api"] is what makes this bindable to type 60 at all
+ *            (controller/channel.go rejects it otherwise).
  *
- *   new_api  (channel type 60, key = a token of the upstream gateway)
- *     The upstream is another New API gateway with this same plugin installed,
- *     so its own native routes are addressed instead, with the channel key sent
- *     as a Bearer token. The host injects ctx.authHeader as "Bearer <key>" and
- *     ctx.upstream.kind as "new_api" for that channel type
- *     (relay/channel/task/jsplugin/adaptor.go applyUpstreamCredentials):
- *       POST <gateway>/simpass/otp           -> task envelope incl. verify_url
- *       POST <gateway>/simpass/verify        -> completed result
- *       GET  <gateway>/simpass/task/<id>     -> status plus latest result
- *     Declaring upstreams: ["new_api"] is what makes this plugin bindable to a
- *     type-60 channel at all (controller/channel.go rejects it otherwise).
+ * All three models answer within the submit call, so every task is immediately
+ * terminal and nothing is ever polled. Two deliberate consequences:
  *
- * Two upstream shapes share one plugin, selected by model:
- *
- *   simpass-otp     Asynchronous. Creates an OTP challenge and polls until the
- *                   player scans the QR code.
- *   simpass-验证    Synchronous. The user info lookup already is the answer, so
- *                   submit completes immediately and there is nothing to poll.
- *
- * Native routes exist because the generic task API cannot carry the answers
- * back: GET /v1/tasks/<id> returns only task_id, platform, status, progress,
- * fail_reason and timestamps, so the caller can neither build the QR payload
- * (the upstream otp_id is kept in private task data) nor read the verification
- * result. These routes render the upstream payload to the caller directly:
- *
- *   POST /simpass/otp            -> task envelope incl. verify_url
- *   POST /simpass/verify         -> verification result (immediate)
- *   GET  /simpass/task/:task_id  -> current status plus the latest upstream data
- *
- * All three require a New API token (Bearer) and are scoped to the calling
- * user. The upstream payload is returned under "result". When the task ran
- * against another gateway, that gateway's own envelope is unwrapped, so a
- * caller sees the same "result" shape in both topologies.
- *
- * Scope is deliberately narrow for 0.0.1: no Image/Video protocol and no
- * artifacts. The generic entry POST /v1/tasks/simpass keeps working.
+ *   - A business rejection (a wrong verify code, or an upstream code other than
+ *     200) is reported as an immediate FAILURE. The host then renders the native
+ *     route response normally -- the caller still gets HTTP 200 with the
+ *     documented error envelope -- while billing is zeroed for that submission
+ *     (relay/relay_task.go: finalQuota = 0 on an immediate failure).
+ *   - The documented stream: true long poll (hold up to 60s until the player
+ *     scans) cannot be reproduced here: plugin hooks are synchronous and cannot
+ *     sleep, retry, or hold a connection. A caller polls simpass-otp-查询
+ *     instead, which returns the current status at once.
  */
 
+const DOC_URL = "https://txpass-2.apifox.cn";
 const DEFAULT_BASE_URL = "https://pass.simpfun.cn";
+
+const AUTH_PATH = "/api/dev/auth";
 const OTP_PATH = "/api/dev/otp";
-const INFO_PATH = "/api/dev/info";
 const QR_PATH = "/api/otp";
 
-/** Native route paths of this plugin, addressed on an upstream gateway. */
-const GATEWAY_OTP_PATH = "/simpass/otp";
-const GATEWAY_VERIFY_PATH = "/simpass/verify";
-const GATEWAY_TASK_PATH = "/simpass/task/";
+/** This plugin's own chat route, and the same path on an upstream gateway. */
+const CHAT_PATH = "/simpass/v1/chat/completions";
 
 const UPSTREAM_NEW_API = "new_api";
 
-const MODEL_OTP = "simpass-otp";
-const MODEL_INFO = "simpass-验证";
+const MODEL_AUTH = "simpass-auth1";
+const MODEL_OTP_CREATE = "simpass-otp-请求";
+const MODEL_OTP_QUERY = "simpass-otp-查询";
+const MODELS = [MODEL_AUTH, MODEL_OTP_CREATE, MODEL_OTP_QUERY];
 
-/** The only terminal OTP status the upstream documents. */
-const OTP_STATUS_VERIFIED = "verified";
-
-/** Optional parameters of the OTP creation call, forwarded only when present. */
-const OTP_OPTIONAL_PARAMS = ["mc_uuid", "mc_username", "player_ip"];
+/** Optional player fields, forwarded to the upstream only when supplied. */
+const PLAYER_PARAMS = ["mc_username", "mc_uuid", "player_ip"];
 
 export const meta = {
   apiVersion: 1,
@@ -88,8 +99,8 @@ export const meta = {
   version: "0.0.1",
   author: { name: "星涵煦", url: "https://github.com/xinghanxu6666" },
   description: {
-    en: "SimPass (JianHuanTong) WeChat identity verification: create OTP challenges and look up player verification info",
-    zh: "SimPass 简幻通微信身份验证：生成 OTP 认证并查询玩家验证信息",
+    en: "SimPass (JianHuanTong) WeChat identity verification, served as an OpenAI Chat Completions compatible endpoint",
+    zh: "SimPass 简幻通微信身份验证，以 OpenAI Chat Completions 兼容接口对外提供服务",
   },
   baseUrl: DEFAULT_BASE_URL,
   auth: "api_key",
@@ -98,30 +109,17 @@ export const meta = {
   // type (60) here, because a task plugin binds through the channel's
   // task_plugin_key setting instead. SimPass has no legacy channel type.
   upstreams: ["vendor", "new_api"],
-  models: [MODEL_OTP, MODEL_INFO],
+  models: MODELS,
   fetchMode: "per_task",
   routes: [
     {
       method: "POST",
-      path: "/simpass/otp",
+      path: CHAT_PATH,
       type: "submit",
-      action: "otp",
-      decode: "decodeOtpSubmit",
-      render: "renderOtpSubmit",
-    },
-    {
-      method: "POST",
-      path: "/simpass/verify",
-      type: "submit",
-      action: "verify",
-      decode: "decodeVerifySubmit",
-      render: "renderVerifySubmit",
-    },
-    {
-      method: "GET",
-      path: "/simpass/task/:task_id",
-      type: "query",
-      render: "renderTaskQuery",
+      action: "chat",
+      decode: "decodeChat",
+      render: "renderChat",
+      models: MODELS,
     },
   ],
   usageSchema: {
@@ -165,9 +163,9 @@ function resolveModel(ctx) {
 }
 
 function assertKnownModel(model) {
-  if (model !== MODEL_OTP && model !== MODEL_INFO) {
+  if (MODELS.indexOf(model) === -1) {
     throw new Error(
-      'SimPass does not serve model "' + model + '"; use ' + MODEL_OTP + " or " + MODEL_INFO
+      'SimPass does not serve model "' + model + '"; use ' + MODELS.join(", ")
     );
   }
   return model;
@@ -207,9 +205,15 @@ function gatewayAuth(ctx) {
   return "Bearer " + requireApiKey(ctx);
 }
 
-function gatewayHeaders(ctx, json) {
-  const headers = { Authorization: gatewayAuth(ctx), Accept: "application/json" };
+function jsonHeaders(json) {
+  const headers = { Accept: "application/json" };
   if (json) headers["Content-Type"] = "application/json";
+  return headers;
+}
+
+function gatewayHeaders(ctx, json) {
+  const headers = jsonHeaders(json);
+  headers.Authorization = gatewayAuth(ctx);
   return headers;
 }
 
@@ -227,35 +231,26 @@ function queryString(params) {
   return parts.join("&");
 }
 
-function jsonHeaders() {
-  return { Accept: "application/json" };
+function httpStatus(response) {
+  const status = response ? Number(response.statusCode) : NaN;
+  return Number.isFinite(status) ? status : 0;
 }
 
-/** The upstream reports every failure as { "error": "<message>" }. */
-function upstreamError(body) {
+/** The upstream reports vendor errors as { "error": ... } or { code, msg }. */
+function upstreamMessage(body) {
   const object = asObject(body);
   const error = object.error;
   if (typeof error === "string" && error.trim()) return error.trim();
   if (error && typeof error === "object") {
-    const message = trimmed(error.message);
-    if (message) return message;
+    const nested = trimmed(error.message);
+    if (nested) return nested;
     try {
       return JSON.stringify(error);
     } catch (ignored) {
       return "";
     }
   }
-  return "";
-}
-
-function httpStatus(response) {
-  const status = response ? Number(response.statusCode) : NaN;
-  return Number.isFinite(status) ? status : 0;
-}
-
-function pollStatus(response) {
-  const status = response ? Number(response.status) : NaN;
-  return Number.isFinite(status) ? status : 0;
+  return trimmed(object.msg);
 }
 
 function requirePublicTaskId(ctx) {
@@ -264,10 +259,56 @@ function requirePublicTaskId(ctx) {
   return value;
 }
 
-// --- native route decoding ---------------------------------------------------
+// --- chat envelopes ----------------------------------------------------------
 
-/** Native submit routes only ever accept a JSON object body. */
-function jsonBody(ctx) {
+function successEnvelope(data) {
+  return { success: true, data: data };
+}
+
+function failureEnvelope(message, code) {
+  return {
+    success: false,
+    error: {
+      message: message || "SimPass request failed",
+      type: "upstream_error",
+      code: code || "upstream_failed",
+    },
+    help: "请参考 API 文档: " + DOC_URL,
+  };
+}
+
+function messageContent(body) {
+  const messages = asObject(body).messages;
+  if (!Array.isArray(messages) || messages.length === 0) {
+    throw new Error("messages must be a non-empty array");
+  }
+  return asObject(messages[0]).content;
+}
+
+/** content is documented as a JSON string, but an object is accepted too. */
+function contentParameters(content) {
+  if (typeof content === "string") {
+    const text = content.trim();
+    if (!text) return {};
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (ignored) {
+      throw new Error("content must be a valid JSON string");
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("the content JSON must be an object");
+    }
+    return parsed;
+  }
+  if (content && typeof content === "object" && !Array.isArray(content)) {
+    return content;
+  }
+  return {};
+}
+
+/** Reads the chat envelope a caller sent. */
+function chatBody(ctx) {
   const body = (ctx || {}).body;
   if (!body || body.kind !== "json") {
     throw new Error("a JSON request body is required");
@@ -279,352 +320,266 @@ function jsonBody(ctx) {
   return value;
 }
 
-/**
- * The route owns the model: whatever the caller puts in "model" is overwritten,
- * so a body cannot address a model the route was not declared for.
- */
-function routedBody(ctx, model) {
-  const value = jsonBody(ctx);
-  const copy = {};
-  const names = Object.keys(value);
-  for (let index = 0; index < names.length; index += 1) {
-    copy[names[index]] = value[names[index]];
+/** Reads the chat envelope an upstream gateway answered with. */
+function gatewayEnvelope(body) {
+  const object = asObject(body);
+  const choices = object.choices;
+  if (!Array.isArray(choices) || choices.length === 0) {
+    throw new Error("the upstream New API gateway response did not include choices");
   }
-  copy.model = model;
-  return copy;
+  const message = asObject(asObject(choices[0]).message);
+  const text = trimmed(message.content);
+  if (!text) {
+    throw new Error("the upstream New API gateway response has an empty message content");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (ignored) {
+    throw new Error("the upstream New API gateway message content is not valid JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("the upstream New API gateway message content is not a JSON object");
+  }
+  return parsed;
 }
 
-/**
- * A result produced by another New API gateway is that gateway's own task
- * envelope. Unwrap it once so the caller sees the same payload whether the task
- * ran against the vendor or against an upstream gateway.
- */
-function unwrapGatewayEnvelope(value) {
-  const object = asObject(value);
-  if (!trimmed(object.task_id) || !trimmed(object.status)) return value;
-  const inner = object.result;
-  if (!inner || typeof inner !== "object" || Array.isArray(inner)) return value;
-  return inner;
+/** The model a caller named, read back from the route request. */
+function chatModel(ctx) {
+  const body = (ctx || {}).body;
+  const value = body && typeof body === "object" ? body.value : undefined;
+  return trimmed(asObject(value).model);
 }
 
-/**
- * The host hands the renderer a TaskView: the public identity plus "data", the
- * latest persisted upstream snapshot. The upstream payload is nested under
- * "result" so a caller can branch on status without unpacking the task record.
- */
-function renderTaskView(task) {
-  const view = asObject(task);
-  const rendered = {
-    task_id: trimmed(view.task_id),
-    status: trimmed(view.status),
-    progress: trimmed(view.progress),
-    created_at: view.created_at,
-    finished_at: view.finished_at,
+function chatCompletion(taskId, model, created, envelope) {
+  return {
+    id: "chatcmpl-" + taskId,
+    object: "chat.completion",
+    created: created,
+    model: model,
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: JSON.stringify(envelope) },
+        finish_reason: "stop",
+      },
+    ],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   };
-  const reason = trimmed(view.fail_reason);
-  if (reason) rendered.fail_reason = reason;
-  const result = unwrapGatewayEnvelope(view.data);
-  if (result && typeof result === "object" && !Array.isArray(result)) {
-    rendered.result = result;
-  }
-  return rendered;
 }
 
 export const native = {
-  decodeOtpSubmit: function (ctx) {
+  decodeChat: function (ctx) {
+    const body = chatBody(ctx);
+    const model = assertKnownModel(trimmed(body.model));
+    if (typeof body.stream === "boolean" && body.stream) {
+      // The host cannot hold a connection open for a plugin, so the documented
+      // long poll is served as an immediate status instead of being silently
+      // ignored. Callers poll simpass-otp-查询 for the same effect.
+      if (model !== MODEL_OTP_QUERY) {
+        throw new Error("stream is not supported on " + model + "; it is only meaningful on " + MODEL_OTP_QUERY);
+      }
+    }
     return {
       kind: "submit",
-      model: MODEL_OTP,
-      action: "otp",
-      requestBody: routedBody(ctx, MODEL_OTP),
+      model: model,
+      action: model,
+      requestBody: contentParameters(messageContent(body)),
     };
   },
 
-  decodeVerifySubmit: function (ctx) {
-    return {
-      kind: "submit",
-      model: MODEL_INFO,
-      action: "verify",
-      requestBody: routedBody(ctx, MODEL_INFO),
-    };
-  },
-
-  renderOtpSubmit: function (ctx, task) {
-    return renderTaskView(task);
-  },
-
-  renderVerifySubmit: function (ctx, task) {
-    return renderTaskView(task);
-  },
-
-  renderTaskQuery: function (ctx, task) {
-    return renderTaskView(task);
+  renderChat: function (ctx, task) {
+    const view = asObject(task);
+    const data = view.data;
+    const envelope =
+      data && typeof data === "object" && !Array.isArray(data) && typeof asObject(data).success === "boolean"
+        ? data
+        : failureEnvelope("SimPass did not return a usable result", "internal_error");
+    return chatCompletion(
+      trimmed(view.task_id),
+      chatModel(ctx),
+      view.created_at,
+      envelope
+    );
   },
 
   error: function (ctx, error) {
     const message =
       typeof error === "string" ? error.trim() : trimmed(error && error.message);
-    return { error: message || "SimPass request failed" };
+    return failureEnvelope(message, "format_error");
   },
 };
 
 // --- submit ------------------------------------------------------------------
 
-/** The OTP call forwards only the optional player fields that were supplied. */
-function otpParameters(requestBody) {
-  const body = asObject(requestBody);
-  const params = {};
-  for (let index = 0; index < OTP_OPTIONAL_PARAMS.length; index += 1) {
-    const name = OTP_OPTIONAL_PARAMS[index];
-    if (Object.prototype.hasOwnProperty.call(body, name) && trimmed(body[name])) {
-      params[name] = body[name];
-    }
-  }
-  return params;
+function numericParameter(value, name) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const text = trimmed(value);
+  if (text && /^[0-9]+$/.test(text)) return Number(text);
+  throw new Error(name + " must be a number");
 }
 
-/** simpass-验证 accepts the player id the caller wants verified. */
-function requireUserId(requestBody) {
-  const body = asObject(requestBody);
-  const raw = body.user_id;
-  const value = typeof raw === "number" && Number.isFinite(raw) ? String(raw) : trimmed(raw);
-  if (!value) {
-    throw new Error("user_id must be a non-empty string or number");
+function forwardedPlayers(source, target) {
+  for (let index = 0; index < PLAYER_PARAMS.length; index += 1) {
+    const name = PLAYER_PARAMS[index];
+    if (Object.prototype.hasOwnProperty.call(source, name) && trimmed(source[name])) {
+      target[name] = source[name];
+    }
   }
-  return value;
+  return target;
+}
+
+/** The chat envelope this plugin would send to an upstream gateway. */
+function gatewayChatBody(model, parameters) {
+  return {
+    model: model,
+    messages: [{ role: "user", content: JSON.stringify(parameters) }],
+  };
 }
 
 export function buildSubmitRequest(ctx) {
   const scope = ctx || {};
   const model = assertKnownModel(resolveModel(scope));
-  const gateway = isGateway(scope);
+  const parameters = asObject(scope.requestBody);
 
-  if (model === MODEL_INFO) {
-    const userId = requireUserId(scope.requestBody);
-    if (gateway) {
-      return {
-        url: upstreamBase(scope) + GATEWAY_VERIFY_PATH,
-        method: "POST",
-        headers: gatewayHeaders(scope, true),
-        body: { user_id: userId },
-      };
-    }
-    const url =
-      upstreamBase(scope) +
-      INFO_PATH +
-      "?" +
-      queryString({ uuid: requireApiKey(scope), user_id: userId });
-    return { url: url, method: "GET", headers: jsonHeaders() };
-  }
-
-  const forwarded = otpParameters(scope.requestBody);
-  if (gateway) {
+  if (isGateway(scope)) {
     return {
-      url: upstreamBase(scope) + GATEWAY_OTP_PATH,
+      url: upstreamBase(scope) + CHAT_PATH,
       method: "POST",
       headers: gatewayHeaders(scope, true),
-      body: forwarded,
+      body: gatewayChatBody(model, parameters),
     };
   }
-  const params = { uuid: requireApiKey(scope) };
-  const names = Object.keys(forwarded);
-  for (let index = 0; index < names.length; index += 1) {
-    params[names[index]] = forwarded[names[index]];
+
+  if (model === MODEL_AUTH) {
+    const body = {
+      uuid: requireApiKey(scope),
+      user_id: numericParameter(parameters.user_id, "user_id"),
+      verify_code: numericParameter(parameters.verify_code, "verify_code"),
+    };
+    forwardedPlayers(parameters, body);
+    return {
+      url: upstreamBase(scope) + AUTH_PATH,
+      method: "POST",
+      headers: jsonHeaders(true),
+      body: body,
+    };
   }
-  const url = upstreamBase(scope) + OTP_PATH + "?" + queryString(params);
-  return { url: url, method: "GET", headers: jsonHeaders() };
+
+  if (model === MODEL_OTP_CREATE) {
+    const query = forwardedPlayers(parameters, { uuid: requireApiKey(scope) });
+    return {
+      url: upstreamBase(scope) + OTP_PATH + "?" + queryString(query),
+      method: "GET",
+      headers: jsonHeaders(false),
+    };
+  }
+
+  const otpId = trimmed(parameters.otp_id);
+  if (!otpId) throw new Error("otp_id must be a non-empty string");
+  return {
+    url: upstreamBase(scope) + OTP_PATH + "?" + queryString({ otp_id: otpId }),
+    method: "GET",
+    headers: jsonHeaders(false),
+  };
 }
 
 export function parseSubmitResponse(ctx, response) {
+  const scope = ctx || {};
   const status = httpStatus(response);
   const body = response ? response.body : null;
-  const failure = upstreamError(body);
-  if (failure) throw new Error(failure);
+  assertKnownModel(resolveModel(scope));
+
+  // A transport-level failure is not a business answer, so it becomes an HTTP
+  // error rather than a fabricated envelope.
   if (status < 200 || status >= 300) {
-    throw new Error("SimPass returned HTTP " + status);
+    throw new Error(upstreamMessage(body) || ("SimPass returned HTTP " + status));
   }
 
-  const scope = ctx || {};
-  const model = assertKnownModel(resolveModel(scope));
-
   if (isGateway(scope)) {
-    // The upstream gateway already ran the vendor exchange and reports its own
-    // task envelope, so its status -- not the raw vendor protocol -- decides
-    // whether this task is already terminal.
-    const object = asObject(body);
-    const taskId = trimmed(object.task_id) || trimmed(object.id);
-    if (!taskId) {
-      throw new Error("the upstream New API gateway response did not include a task_id");
-    }
-    const result = object.result;
-    const taskData =
-      result && typeof result === "object" && !Array.isArray(result) ? result : object;
-    const upstreamStatus = trimmed(object.status).toUpperCase();
-    if (upstreamStatus === "SUCCESS") {
+    const envelope = gatewayEnvelope(body);
+    const taskId = requirePublicTaskId(scope);
+    if (envelope.success === false) {
       return {
         taskId: taskId,
-        taskData: taskData,
-        immediate: { status: "SUCCESS", progress: trimmed(object.progress) || "100%" },
-      };
-    }
-    if (upstreamStatus === "FAILURE") {
-      return {
-        taskId: taskId,
-        taskData: taskData,
+        taskData: envelope,
         immediate: {
           status: "FAILURE",
-          reason: trimmed(object.fail_reason) || "the upstream gateway reported a failure",
+          reason: trimmed(asObject(envelope.error).message) || "the upstream gateway reported a failure",
         },
       };
     }
-    return { taskId: taskId, taskData: taskData };
-  }
-
-  if (model === MODEL_INFO) {
-    const object = asObject(body);
-    if (!Number.isFinite(Number(object.level))) {
-      throw new Error("SimPass user info response is missing a numeric level");
-    }
-    if (typeof object.risky !== "boolean") {
-      throw new Error("SimPass user info response is missing a boolean risky flag");
-    }
-    // create_time and risk_details are display-only, so a missing value must not
-    // fail a call the caller has already paid for.
     return {
-      taskId: requirePublicTaskId(scope),
-      taskData: object,
+      taskId: taskId,
+      taskData: envelope,
       immediate: { status: "SUCCESS", progress: "100%" },
     };
   }
 
+  const model = resolveModel(scope);
   const object = asObject(body);
-  const otpId = trimmed(object.otp_id);
-  if (!otpId) throw new Error("SimPass response did not include otp_id");
-  const expiresIn = Number(object.expires_in);
+  const taskId = requirePublicTaskId(scope);
+
+  if (model === MODEL_AUTH) {
+    const code = Number(object.code);
+    if (Number.isFinite(code) && code !== 200) {
+      const message = trimmed(object.msg) || "SimPass rejected the verification";
+      return {
+        taskId: taskId,
+        taskData: failureEnvelope(message, "auth_error"),
+        immediate: { status: "FAILURE", reason: message },
+      };
+    }
+    return {
+      taskId: taskId,
+      taskData: successEnvelope(object),
+      immediate: { status: "SUCCESS", progress: "100%" },
+    };
+  }
+
+  if (model === MODEL_OTP_CREATE) {
+    const otpId = trimmed(object.otp_id);
+    if (!otpId) throw new Error("SimPass response did not include otp_id");
+    const expiresIn = Number(object.expires_in);
+    return {
+      taskId: taskId,
+      taskData: successEnvelope({
+        otp_id: otpId,
+        expires_in: Number.isFinite(expiresIn) ? expiresIn : null,
+        status: "pending",
+        verify_url: upstreamBase(scope) + QR_PATH + "?otp_id=" + encodeURIComponent(otpId),
+      }),
+      immediate: { status: "SUCCESS", progress: "100%" },
+    };
+  }
+
+  const otpStatus = trimmed(object.status).toLowerCase();
+  if (!otpStatus) throw new Error("SimPass OTP response is missing a status field");
+  const data = { status: otpStatus };
+  if (object.user_id !== undefined) data.user_id = object.user_id;
+  if (object.user_info !== undefined) data.user_info = object.user_info;
   return {
-    taskId: otpId,
-    taskData: {
-      otp_id: otpId,
-      expires_in: Number.isFinite(expiresIn) ? expiresIn : null,
-      verify_url: upstreamBase(scope) + QR_PATH + "?otp_id=" + encodeURIComponent(otpId),
-    },
+    taskId: taskId,
+    taskData: successEnvelope(data),
+    immediate: { status: "SUCCESS", progress: "100%" },
   };
 }
 
 // --- polling -----------------------------------------------------------------
+// Every model answers within the submit call, so no task is ever polled. The
+// hooks still have to exist: fetchMode per_task makes buildQueryRequest a
+// required export (pkg/jsplugin/registry.go requiredHooks).
 
 export function buildQueryRequest(ctx) {
-  const scope = ctx || {};
-  const model = assertKnownModel(resolveModel(scope));
-
-  if (isGateway(scope)) {
-    // Poll the upstream gateway's query route for its own public task id.
-    const gatewayTaskId = trimmed(scope.taskId);
-    if (!gatewayTaskId) throw new Error("SimPass task id is empty");
-    return {
-      url: upstreamBase(scope) + GATEWAY_TASK_PATH + encodeURIComponent(gatewayTaskId),
-      method: "GET",
-      headers: gatewayHeaders(scope, false),
-    };
-  }
-
-  if (model === MODEL_INFO) {
-    // Reached only if the host polls a task that already completed on submit.
-    throw new Error("SimPass user info queries complete synchronously and have no task to retrieve");
-  }
-  const otpId = trimmed(scope.taskId);
-  if (!otpId) throw new Error("SimPass OTP task id is empty");
-  const url = upstreamBase(scope) + OTP_PATH + "?" + queryString({ otp_id: otpId });
-  return { url: url, method: "GET", headers: jsonHeaders() };
+  assertKnownModel(resolveModel(ctx || {}));
+  throw new Error("SimPass answers within the submit call and has no task to retrieve");
 }
 
 export function parseTaskResult(ctx, body, response) {
-  const scope = ctx || {};
-  const model = resolveModel(scope);
-  const status = pollStatus(response);
-  const failure = upstreamError(body);
-
-  if (isGateway(scope)) {
-    // The upstream gateway already normalizes the vendor protocol, so its status
-    // vocabulary is New API's own and maps across without translation.
-    if (status === 404) {
-      return {
-        status: "FAILURE",
-        reason: failure || "the upstream gateway no longer has this task",
-      };
-    }
-    if (status === 401 || status === 403) {
-      return {
-        status: "FAILURE",
-        reason: failure || "the upstream gateway rejected the channel token",
-      };
-    }
-    if (status < 200 || status >= 300) {
-      return {
-        status: "UNKNOWN",
-        reason: failure || "the upstream gateway returned HTTP " + status,
-      };
-    }
-    const object = asObject(body);
-    const upstreamStatus = trimmed(object.status).toUpperCase();
-    const reason = trimmed(object.fail_reason) || failure;
-    if (upstreamStatus === "SUCCESS") {
-      return { status: "SUCCESS", progress: trimmed(object.progress) || "100%" };
-    }
-    if (upstreamStatus === "FAILURE") {
-      return { status: "FAILURE", reason: reason || "the upstream gateway reported a failure" };
-    }
-    if (
-      upstreamStatus === "QUEUED" ||
-      upstreamStatus === "SUBMITTED" ||
-      upstreamStatus === "NOT_START"
-    ) {
-      return { status: "QUEUED" };
-    }
-    if (upstreamStatus === "IN_PROGRESS") {
-      return { status: "IN_PROGRESS" };
-    }
-    return {
-      status: "UNKNOWN",
-      reason: upstreamStatus
-        ? 'unrecognized upstream gateway status "' + upstreamStatus + '"'
-        : "the upstream gateway response is missing a status",
-    };
-  }
-
-  if (model === MODEL_INFO) {
-    return {
-      status: "UNKNOWN",
-      reason: "SimPass user info queries complete synchronously and have no asynchronous task",
-    };
-  }
-  if (model !== MODEL_OTP) {
-    return { status: "UNKNOWN", reason: 'SimPass does not serve model "' + model + '"' };
-  }
-
-  // An expired or unknown otp_id is terminal, not transient: never report it as
-  // in progress or the task would keep occupying resources until the deadline.
-  if (status === 404) {
-    return { status: "FAILURE", reason: failure || "SimPass OTP is invalid or has expired" };
-  }
-  if (status === 401 || status === 403) {
-    return { status: "FAILURE", reason: failure || "SimPass rejected the developer UUID" };
-  }
-  if (status < 200 || status >= 300) {
-    return { status: "UNKNOWN", reason: failure || "SimPass returned HTTP " + status };
-  }
-
-  const otpStatus = trimmed(asObject(body).status).toLowerCase();
-  if (!otpStatus) {
-    return { status: "UNKNOWN", reason: "SimPass OTP response is missing a status field" };
-  }
-  // The polling endpoint only ever answers "not verified yet" or "verified": the
-  // documented pending shape carries a status and nothing else, and a reply
-  // without any status is treated as unrecognized above.
-  if (otpStatus !== OTP_STATUS_VERIFIED) {
-    return { status: "IN_PROGRESS" };
-  }
-  return { status: "SUCCESS", progress: "100%" };
+  return {
+    status: "UNKNOWN",
+    reason: "SimPass answers within the submit call and has no asynchronous task",
+  };
 }
 
 // --- usage -------------------------------------------------------------------
